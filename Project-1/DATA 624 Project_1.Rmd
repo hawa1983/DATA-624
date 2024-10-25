@@ -1,0 +1,1828 @@
+---
+title: "DATA 624 Project 1"
+author: "Fomba Kassoh"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 5
+    number_sections: true
+    highlight: tango
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load the required libraries
+
+```{r}
+# Load necessary libraries
+# Function to check and install packages if not already installed
+install_if_missing <- function(packages) {
+  missing_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing_packages)) {
+    install.packages(missing_packages)
+  }
+}
+
+# List of required packages, including fpp3
+packages <- c("readxl", "tsibble", "dplyr", "fable", "lubridate", "tseries", "forecast", "zoo", "tidyr", "fpp3", "ggplot2", "gridExtra", "kableExtra", "openxlsx", "imputeTS", "tseries", "purrr")
+
+# Install missing packages
+install_if_missing(packages)
+
+# Load all the required libraries
+library(fpp3)       # Includes tsibble, fable, and others
+library(tidyr)
+library(tseries)
+library(forecast)
+library(zoo)
+library(gridExtra)
+library(kableExtra)
+library(openxlsx)
+library(imputeTS)
+library(readxl)      # Correctly load the readxl package (read_excel is a function inside it)
+library(tseries)
+library(purrr)
+```
+
+# Part A – ATM Forecast 
+
+## 1. Introduction
+
+In **Part A** of this project, we analyze ATM withdrawal data to explore patterns and trends over time, with a focus on handling missing data and preparing the dataset for time series forecasting. The dataset consists of daily transaction records from multiple ATMs, including the date of each transaction, the ATM identifier, and the amount of cash withdrawn. With 1,474 records spanning a defined time period, the data presents some challenges, such as missing values in both the ATM and cash columns. A key goal of this project is to address these gaps using appropriate imputation techniques while preserving the time series characteristics, including potential seasonality and trends. By transforming and visualizing the data, we aim to develop a robust forecasting model that can predict future cash withdrawals and provide insights into ATM usage patterns.
+
+## 2. Data Preparation
+
+### Load the data
+
+A review of the data below shows that the dataset consists of **1,474 rows** and **3 columns**. Here is a brief description of the columns:
+
+- **DATE**: This column contains the dates (in `datetime` format) for the ATM transactions. There are no missing values in this column.
+- **ATM**: This column specifies the ATM identifier (e.g., "ATM1", "ATM2"). There are 14 missing values in this column, as it has 1,460 non-null entries.
+- **Cash**: This column records the cash withdrawn from the ATMs (in `float64` format). There are 19 missing values in this column, as it has 1,455 non-null entries.
+
+The dataset spans daily transactions, and missing data may need to be addressed before analysis, particularly for forecasting purposes.
+
+```{r}
+
+# File path
+file_path <- "ATM624Data.xlsx"
+
+# Load the file using read_excel
+atm_data <- read_excel(file_path, col_types = c("numeric", "text", "numeric"))
+
+# Continue with the rest of your code (date conversion, renaming, etc.)
+atm_data <- atm_data %>%
+  mutate(DATE = as_date(DATE, origin = "1899-12-30")) |>  # Convert numeric date
+  rename(atm = ATM, date = DATE, cash = Cash) |>  # Rename the 'ATM' column to 'name'
+  as_tsibble(index = date, key = atm) |>  # Convert to tsibble format
+  arrange(date)
+
+summary(atm_data) |>
+  kable(caption = "ATM Data Summary") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+### Identify any missing values.
+
+Identify and quantify the presence of missing values within the dataset, focusing specifically on the cash column and restricting the analysis to data recorded on or before April 30, 2010 which is the end of observation. This helps in understanding the scope and distribution of missing data within the given timeframe.
+
+The output below shows a summary of missing values in the dataset, excluding dates after April 30, 2010. Specifically:
+- There are **no missing values** in the `date` and `atm` columns.
+- There are **5 missing values** in the `cash` column, indicating a small portion of the withdrawal amounts are missing within the filtered date range.
+
+```{r}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# Filter data for entries before May 2010
+atm_data <- atm_data |>
+  filter(date <= as.Date("2010-04-30"))  # Exclude dates after April 30, 2010
+
+# Check for missing values in all columns of the filtered data
+missing_values <- sapply(atm_data, function(x) sum(is.na(x)))
+
+# Convert missing values summary to a data frame
+missing_values_df <- data.frame(Column = names(missing_values), Missing_Values = missing_values)
+
+# Display the missing values using kable
+missing_values_df |>
+  kable(caption = "Summary of Missing Values (Excluding Dates After April 30, 2010)") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+### Check for patterns in missing values.
+
+The output below provides a summary of missing `cash` values by specific dates, day of the week, and ATM location, focusing on data prior to May 2010. Each row represents a missing data point for a specific ATM on a particular date. This detailed breakdown helps in identifying potential **patterns** in the missing data, such as whether certain ATMs or days of the week are more prone to missing values. Understanding these patterns is crucial for deciding the most appropriate method for **imputing** the missing data, such as time-based or location-based imputation strategies.
+
+From the output, we can observe the following potential **patterns** in the missing data:
+
+- **ATM-Specific Patterns**: The missing data is distributed across two ATMs, `ATM1` and `ATM2`. The occurrences of missing values alternate between these two ATMs, with both having multiple instances of missing `cash` values.
+   
+- **Temporal Patterns**: The missing values are spread across different days of the week, with no immediate concentration on weekends or weekdays. The dates with missing values range from **June 13, 2009 (Saturday)** to **June 24, 2009 (Wednesday)**, indicating that missing data is not confined to a particular type of day, such as weekends or weekdays.
+
+These observations suggest that the missing data is likely distributed across both ATMs and dates without a strong temporal or ATM-specific bias.
+
+```{r}
+
+# Filter rows where there are missing values in the 'cash' column and dates are before May 2010
+missing_data_summary <- atm_data |>
+  as_tibble() |>
+  filter(is.na(cash) & date <= as.Date("2010-04-30")) |>  # Focus on rows with missing cash values and date <= April 30, 2010
+  mutate(day_of_week = wday(date, label = TRUE)) |>       # Add a day of the week column
+  group_by(date, day_of_week, atm) |>                     # Group by date, day of week, and ATM
+  summarise(missing_count = sum(is.na(cash)), .groups = "drop") |>  # Count missing values and drop grouping after summarizing
+  arrange(date)                                            # Arrange by date
+
+# Display the results
+missing_data_summary |>
+  kable(caption = "Summary of Missing Values by Date and ATM (Excluding May 2010)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+### Impute missing values for each ATM based on the mean for the same day of the same month
+
+The missing values may be due to system downtimes or maintenance, and no transactions were recorded because the ATMs were genuinely not operational. In this scenario, filling missing values with 0 could be a valid approach if the missing data is genuinely the result of downtime or periods where no activity occurred. However, it's important to note that this can potentially distort the time series data and lead to inaccurate forecasting. An approach which would better preserve the patterns and integrity of the data for forecasting purposes will be used for missing data imputation.
+
+The custom imputation method below fills missing values in the ATM withdrawal data based on the **average withdrawals for the same weekday within the same month**. By grouping the data by ATM, year-month, and weekday (e.g., all Tuesdays in May), missing values are replaced with the average cash withdrawals for that specific day across the same month.
+
+**Why We Use This Method:**
+
+- **Preserves Temporal Patterns**: This approach captures both **weekly** and **monthly trends**, ensuring that the imputation respects seasonal withdrawal behavior.
+- **Localized Imputation**: The method focuses on each ATM, month, and weekday, providing more realistic imputations by reflecting actual patterns during that specific time.
+- **Supports Accurate Forecasting**: By maintaining the structure of the time series, this method enhances the accuracy of any future forecasting, ensuring that the missing data is imputed in context.
+
+This method is ideal for datasets with distinct weekly or monthly patterns, ensuring that imputed values align with expected trends.
+
+```{r}
+library(lubridate)
+library(dplyr)
+
+# Group by ATM, year-month, and weekday, then impute missing values for the same weekday in the same month
+atm_data <- atm_data %>%
+  group_by_key() %>%
+  mutate(
+    # Extract year-month and weekday information
+    year_month = floor_date(date, "month"),
+    weekday = wday(date, label = TRUE),
+    
+    # Impute missing cash values based on the same weekday in the same month
+    cash = ifelse(
+      is.na(cash),
+      ave(cash, year_month, weekday, FUN = function(x) mean(x, na.rm = TRUE)),
+      cash
+    )
+  ) %>%
+  ungroup()  # Ungroup the data
+
+# Check for missing values after imputation and get a basic summary of the data
+missing_imputed_values <- colSums(is.na(atm_data))
+
+# Display the results
+missing_imputed_values %>%
+  kable(caption = "Summary of Missing Values by Date and ATM (Excluding May 2010)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+### Summarize the data and plot the distribution to understand its structure, contents and identify anomalies.
+
+The summary statistics and box plots for each ATM reveals the following:
+
+- **ATM1**:
+   - The cash withdrawals at ATM1 show a balanced distribution, with a median withdrawal of 91.00. The majority of withdrawals fall between 73.00 and 108.00, and the largest withdrawal recorded is 180.00. There are a few outliers above the interquartile range, suggesting some larger-than-usual transactions.
+
+- **ATM2**:
+   - Withdrawals from ATM2 have a slightly lower median of 66.00, with most withdrawals occurring between 25.00 and 93.00. The maximum recorded withdrawal is 147.00. The distribution is somewhat similar to ATM1, but with generally smaller withdrawal amounts. There are also a few outliers indicating higher than typical withdrawals.
+
+- **ATM3**:
+   - ATM3 appears to be underutilized, with a median of 0.00 and a significant number of transactions showing zero withdrawals. The few recorded withdrawals are very small, with the largest being only 96.00. The distribution indicates that ATM3 sees minimal activity, with outliers reflecting withdrawals only at the end of the observation period. **ATM3** was either out of service for a prolonged time period or is newly installed.
+
+- **ATM4**:
+   - ATM4 shows the most significant cash withdrawal activity, with a median of 403.84 and a much wider range of withdrawals. The bulk of withdrawals fall between 124.33 and 704.51, and the maximum recorded withdrawal is an exceptionally high 10,919.76. The unually extreme value of 10,919.76 is not typical of ATM withdrawai. It is either a fraudulent withdrawal or a malfunction. This values will be excluded from ATM4 for forecasting purposes. Without the extremely high outlier, the distribution for ATM4 appears more balanced. This suggests that ATM4 likely serves a high-demand location, potentially with frequent and sizable withdrawals.
+
+```{r}
+# Step 1: Convert the tsibble to a tibble
+atm_summary_data <- as_tibble(atm_data)  # Convert tsibble to tibble
+
+# Step 2: Exclude the DATE column and group by ATM
+atm_summary <- atm_summary_data |>
+  select(-date) |>  # Remove the DATE column
+  group_by(atm) |>  # Group by ATM column
+  summarise(
+    min = min(cash, na.rm = TRUE),
+    `25%` = quantile(cash, 0.25, na.rm = TRUE),
+    median = median(cash, na.rm = TRUE),
+    mean = mean(cash, na.rm = TRUE),
+    `75%` = quantile(cash, 0.75, na.rm = TRUE),
+    max = max(cash, na.rm = TRUE)
+  )
+
+# Step 3: Display the atm_summary data frame using kable for better presentation
+atm_summary |>
+  kable(caption = "Summary of Imputed ATM Data") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+```{r}
+# Create separate box plots for each ATM
+p1 <- atm_data |>
+  filter(atm == "ATM1") |>
+  ggplot(aes(x = atm, y = cash)) +
+  geom_boxplot() +
+  labs(title = "Figure 1: ATM1", y = "Cash Withdrawals") 
+
+
+p2 <- atm_data |>
+  filter(atm == "ATM2") |>
+  ggplot(aes(x = atm, y = cash)) +
+  geom_boxplot() +
+  labs(title = "Figure 2: ATM2", y = "Cash Withdrawals") 
+
+p3 <- atm_data |>
+  filter(atm == "ATM3") |>
+  ggplot(aes(x = atm, y = cash)) +
+  geom_boxplot() +
+  labs(title = "Figure 3: ATM3", y = "Cash Withdrawals")
+
+# Plot for ATM4 with outlier labeled
+p4 <- atm_data |>
+  filter(atm == "ATM4") |>
+  ggplot(aes(x = atm, y = cash)) +
+  geom_boxplot(outlier.colour = "red", outlier.shape = 16, outlier.size = 3) +
+  
+  # Label the specific outlier (10,919.76) - filter the atm_data explicitly
+  geom_text(
+    data = atm_data |>
+      filter(atm == "ATM4", cash > 10919),  # Explicitly filter atm_data
+    aes(label = cash),
+    vjust = -0.5, color = "blue", size = 3
+  ) +
+  
+  labs(title = "Figure 4: ATM4 with Outlier Labeled",
+       y = "Cash Withdrawals",
+       x = "ATM")
+
+# Plot ATM4 again without the max value
+p4_filtered <- atm_data |>
+  filter(atm == "ATM4", cash != max(cash, na.rm = TRUE)) |>
+  ggplot(aes(x = atm, y = cash)) +
+  geom_boxplot(outlier.colour = "red", outlier.shape = 16, outlier.size = 3) +
+  
+  labs(title = "Figure 5: ATM4 (Max Value Excluded)",
+       y = "Cash Withdrawals",
+       x = "ATM")
+
+# Combine the plots using gridExtra with 2 columns
+grid.arrange(p1, p2, p3, p4, p4_filtered, ncol = 2)
+
+# Replace the maximum Cash value for ATM4 with the average for the same day of the month
+atm_data <- atm_data %>%
+  group_by(atm) %>%
+  mutate(cash = ifelse(
+    atm == "ATM4" & !is.na(cash) & cash == max(cash[atm == "ATM4"], na.rm = TRUE),
+    ave(cash, day(date), FUN = function(x) mean(x, na.rm = TRUE)),
+    cash
+  )) %>%
+  ungroup()
+
+
+```
+## 3. Time Series Exploration {.tabset}
+
+The objective of this section is to examine the **time series** of cash withdrawals across multiple ATMs using historical transaction data. By analyzing the data for each ATM, we aim to uncover **trends**, **seasonal patterns**, and **fluctuations** that can inform accurate forecasting models. Key techniques such as ARIMA, SARIMA, and ETS will be applied to capture underlying seasonality and trends.
+
+**STL decomposition** is done to breaks down the time series into its **trend**, **seasonality**, and **residual** components. This helps identify how much of the variability is predictable versus random. By understanding whether the data is stationary and if it maintains a constant mean, we can determine any necessary transformations or differencing required for accurate forecasting.
+
+The purpose of the **ACF plots** is to reveal patterns of autocorrelation, identifying both short-term dependencies (e.g., lag 1) and weekly seasonality (e.g., lag 7). These insights help in selecting the best forecasting models by highlighting significant autocorrelations and guiding the incorporation of seasonal effects.
+
+### ATM1 
+
+**Plot the data and identify any unusual observations**
+
+The time series plot for ATM1 cash withdrawals shows strong weekly seasonality but no clear long-term trend, with occasional spikes in variance. To prepare this series for modeling, **Box-Cox transformation** may be required to stabilize the variance, and **differencing** (both non-seasonal and seasonal) will likely be needed to remove the seasonality and make the series stationary for accurate forecasting.
+
+```{r time-series-ATM1_plot}
+# Plot for ATM1
+atm1_data <- atm_data |>
+  filter(atm == "ATM1")
+
+atm1_data |>
+  ggplot(aes(x = date, y = cash)) +
+  geom_line() +
+  labs(title = "Cash Withdrawals Over Time - ATM1", x = "Date", y = "Cash Withdrawn") 
+```
+**Transform the data using Box-Cox transformation to stabilize the variance**
+
+***Box-Cox Transformed ATM1:*** The Box-Cox transformed plot for ATM1 shows stabilized variance across time. However, clear weekly seasonal patterns and minor trends still persist, indicating that further differencing (e.g., seasonal differencing) will be necessary for effective time series modeling. SARIMA models with appropriate seasonal components would be suitable for capturing these patterns.
+
+```{r}
+# Step 1: Shift cash values by adding a small constant to handle zero values
+atm1_data <- atm1_data |> 
+  mutate(cash_adjusted = cash + 1)  # Adding 1 to avoid zero or negative values
+
+# Step 2: Calculate the Box-Cox transformation using the adjusted cash values
+box_cox_lambda <- atm1_data |> 
+  BoxCox.lambda(cash_adjusted)  # Calculate lambda for Box-Cox
+
+# Apply transformations and differences
+atm1_data <- atm1_data |> 
+  mutate(
+    box_cox_cash = BoxCox(cash_adjusted, lambda = box_cox_lambda),  # Apply Box-Cox transformation
+  )
+
+# Step 3: Time Series Plot for Box-Cox Transformed Data
+atm1_data |>
+  ggplot(aes(x = date, y = box_cox_cash)) +
+  geom_line() +
+  labs(title = "Box-Cox Transformed ATM1",
+       x = "Time", y = "Box-Cox Transformed ATM1")
+```
+
+**Decompose the Time Series to reveal any seasonality and trend**
+
+Decomposing the time series isolates trend, seasonality, and noise, aiding in model selection and improving forecasting accuracy. The STL decomposition for the **Box-Cox transformed data** of ATM1 reveals a clear **weekly seasonal pattern** and a relatively stable **trend**, with a dip toward the end of the period. The **remainder** component shows random fluctuations with no consistent pattern, indicating some irregularities. The **Box-Cox transformation** has stabilized the variance, and **seasonal differencing** will be required to remove the seasonality for modeling. Suitable models to consider are **SARIMA**, to account for both seasonality and trend, and **ETS**, which can capture the level, trend, and seasonal components.
+
+```{r stl-decomposition-ATM1_plot}
+# STL Decomposition for ATM1
+atm1_data |>
+  model(
+    stl = STL(box_cox_cash ~ trend(window = 7) + season(window = "periodic"), robust = TRUE)
+  ) |>
+  components() |>
+  autoplot() +
+  labs(title = "STL Decomposition - ATM1 (Box-Cox Transformed Withdrawals)")
+```
+
+**ACF Plot**
+
+ACF plot to identify correlation between the time series and its lagged values, further confirms seasonality, trends, and potential autoregressive or moving average components for model selection. The ACF plot for the **Box-Cox transformed ATM1 cash withdrawals** shows strong autocorrelation at **lags 7, 14, and 21**, confirming a clear **weekly seasonality** in the data. These significant spikes at multiples of 7 suggest that withdrawals follow a repeating weekly pattern. This seasonal structure indicates that models incorporating seasonal components, such as **SARIMA** or **ETS**, would be appropriate to capture this behavior in forecasting.
+
+
+```{r acf-ATM1_plot}
+# Generate ACF Plot for ATM1
+atm1_data |>
+  ACF(box_cox_cash) |>
+  autoplot() +
+  labs(title = "ACF Plot for Box-Cox Transformed ATM1 Cash Withdrawals ")
+```
+
+#### ATM1 Forecasting Models {.tabset}
+
+##### ATM1: Differencing 
+
+Given that each of the ATM time series (except ATM3) shows clear seasonality without any ncreasing trend, we'll focus on **ETS**, **non-seasonal ARIMA** and **SARIMA** models. For ATM3, due to sparse data, we will focus on simpler models such as **Random Walk with Drift** and a **non-seasonal ARIMA** model since no clear seasonal patterns can be observed.
+
+The differencing applied to the time series, as seen in the plots, reveals the following:
+
+- **Lag 7 Seasonally Differenced ATM1**: The first plot, which shows seasonal differencing at lag 7, removes the weekly seasonality, resulting in a more stationary series. However, there are still fluctuations and some potential short-term dependencies visible in the plot, which might require further differencing or modeling adjustments.
+
+- **Lag 1 on Lag 7 Differenced ATM1**: The second plot shows the time series after applying both lag 1 differencing (to address short-term dependencies) and lag 7 seasonal differencing. This combined differencing effectively removes both trend and seasonality, resulting in a stationary series suitable for modeling. The remaining fluctuations are random and suggest minimal autocorrelation, indicating that the series is now more stable for forecasting.
+
+Given these transformations, **SARIMA** models are well-suited to capture any remaining autocorrelations while accounting for the seasonal and non-seasonal components. Additionally, **ETS** models may also be appropriate to smooth out level and seasonal components for forecasting.
+
+```{r}
+# Apply differencing
+atm1_data <- atm1_data |> 
+  mutate(
+    diff_lag7 = difference(box_cox_cash, lag = 7),        # Seasonal differencing (lag = 7)
+    diff_lag7_lag1 = difference(diff_lag7, lag = 1)        # First-order differencing after seasonal differencing
+  )
+
+# Step 1: Time Series Plot for Lag 7 Seasonally Differenced Data
+plot1_ts <- atm1_data |>
+  drop_na(diff_lag7) |>
+  autoplot(diff_lag7) + 
+  labs(title = "Lag 7 Seasonally Differenced ATM1",
+       x = "Time", y = "Lag 7 Differenced ATM1")
+
+# Step 2: Time Series Plot for Lag 1 Differenced on Lag 7 Differenced Data
+plot2_ts <- atm1_data |>
+  drop_na(diff_lag7_lag1) |>
+  autoplot(diff_lag7_lag1) + 
+  labs(title = "Lag 1 on Lag 7 Differenced ATM1",
+       x = "Time", y = "Lag 1 on Lag 7 Differenced ATM1")
+
+# Step 7: Combine all time series plots into a grid for comparison
+grid.arrange(plot1_ts, plot2_ts, ncol = 1)
+
+# Step 3: Apply Ljung-Box test to the diff_lag7_lag1 series for ATM1
+ljung_box_results <- atm1_data |>
+  drop_na(diff_lag7_lag1) |>     # Drop NA values before performing Ljung-Box test
+  features(diff_lag7_lag1, ljung_box, lag = 10)  # Apply Ljung-Box test with lag = 10
+
+# Display the Ljung-Box test results
+ljung_box_results |>
+  kable(caption = "Ljung Test Result for Lag 1 on Lag 7 Differencing") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+##### ATM1: Model Selection 
+
+**Examine the ACF/PACF plots**
+
+Based on the ACF and PACF plots for the **Box-Cox transformed cash withdrawals** (without differencing), the following models are recommended, **including differencing to achieve stationarity**:
+
+1. **ARIMA(1,1,0)**: The **PACF plot** shows a significant spike at **lag 1**, suggesting a strong AR(1) component. Since the data is not yet differenced, this model will include first differencing to make the series stationary.
+
+2. **ARIMA(0,1,1)**: The **ACF plot** shows a noticeable spike at **lag 1**, indicating an MA(1) component. The first differencing (d=1) is necessary to remove non-stationarity in the data.
+
+3. **SARIMA(1,1,0)(0,1,1)[7]**: Due to the clear **seasonal spikes at lag 7**, this seasonal ARIMA model will include an AR(1) component for short-term dependencies and a seasonal MA(1) component for the weekly seasonality, along with both non-seasonal and seasonal differencing.
+
+4. **SARIMA(0,1,1)(0,1,1)[7]**: The seasonal moving average model is suggested based on the significant MA(1) and seasonal MA(1) components observed in the ACF plot. This model will include both non-seasonal and seasonal differencing to address the weekly seasonality.
+
+5. **SARIMA(1,1,1)(0,1,1)[7]**: This seasonal mixed model incorporates both AR(1) and MA(1) components along with a seasonal MA(1) component to capture short-term and seasonal autocorrelation, while using differencing to ensure stationarity.
+
+6. **ETS (Exponential Smoothing Model)**: Although differencing is necessary for ARIMA models, ETS models can automatically handle trends and seasonality without explicit differencing. This makes ETS a flexible choice for capturing level, trend, and seasonal components in the data.
+
+These models incorporate the necessary differencing (both seasonal and non-seasonal) to stabilize the variance and address the autocorrelation patterns in the transformed dataset.
+
+```{r}
+# Plot ACF/PACF
+atm1_data |>
+  gg_tsdisplay(box_cox_cash, plot_type = 'partial', lag_max = 24)
+```
+
+##### ATM1: Fit and Select Model
+
+**ATM1: Model Selection**
+
+Based on the information criteria (AICc, BIC) and the significance of the model coefficients, the best model can be determined as follows:
+
+1. **Stepwise ARIMA Model (`stepwise`)**:
+   - **AICc** = 3286.815, which is the lowest among all models.
+   - This model efficiently captures both short-term and seasonal patterns, as indicated by the ARIMA structure **(ARIMA(0,0,1)(0,1,2)[7])**.
+   - Significant coefficients include the `ma1` term (p-value = 0.0008648) and both `sma1` and `sma2` terms, with p-values of 0.0000000 and 0.0343038 respectively. These significant terms demonstrate the model’s ability to handle both short-term autocorrelations and weekly seasonality.
+
+2. **Search ARIMA Model (`search`)**:
+   - **AICc** = 3286.815, equal to the stepwise model.
+   - The parameterization of this model is similar to the stepwise model, with significant `ma1`, `sma1`, and `sma2` terms. However, it does not offer additional benefits over the stepwise model in terms of predictive power or information criteria.
+
+3. **SARIMA(1,1,1)(0,1,1)[7] Model**:
+   - **AICc** = 3291.650, slightly higher than the stepwise model.
+   - This model incorporates both autoregressive and moving average components with seasonal differencing, but its AICc is higher, indicating it is less optimal for the data compared to the stepwise ARIMA model.
+
+The **Stepwise ARIMA Model (`stepwise`)** is selected as the best model based on its lowest AICc and the significance of its coefficients. This model effectively captures the key patterns in ATM1 cash withdrawals and is the preferred choice for forecasting.
+
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(fable)
+library(tsibble)
+library(ggplot2)
+library(tidyr)
+library(kableExtra)
+
+# Fit ARIMA and ETS models to the Box-Cox transformed ATM data
+atm1_fit <- atm1_data |>
+  model(
+    arima110 = ARIMA(box_cox_cash ~ pdq(1,1,0)),    # ARIMA(1,1,0)
+    arima011 = ARIMA(box_cox_cash ~ pdq(0,1,1)),    # ARIMA(0,1,1)
+    sarima101011 = ARIMA(box_cox_cash ~ pdq(1,0,1) + PDQ(0,1,1, period = 7)),  # SARIMA(1,1,1)(0,1,1)[7]
+    sarima011011 = ARIMA(box_cox_cash ~ pdq(0,1,1) + PDQ(0,1,1, period = 7)),  # SARIMA(0,1,1)(0,1,1)[7]
+    sarima111011 = ARIMA(box_cox_cash ~ pdq(1,1,1) + PDQ(0,1,1, period = 7)),  # SARIMA(1,1,1)(0,1,1)[7]
+    ets = ETS(box_cox_cash),  # Exponential Smoothing Model (ETS)
+    stepwise = ARIMA(box_cox_cash),                # Automatically selected ARIMA using stepwise search
+    search = ARIMA(box_cox_cash, stepwise = FALSE)  # Automatically selected ARIMA using exhaustive search
+  )
+
+# Extract the model summary with AICc and BIC values
+model_summary <- glance(atm1_fit) |>
+  arrange(AICc) |>
+  select(.model, AIC, AICc, BIC, MSE, AMSE)
+
+# Extract the ARIMA orders (p,d,q) for each model
+model_orders <- atm1_fit |>
+  pivot_longer(cols = -atm, names_to = "Model name", values_to = "Orders") |>
+  select(`Model name`, Orders)
+
+# Combine the AICc, BIC and ARIMA orders into a single data frame
+combined_results <- model_summary |> 
+  left_join(model_orders, by = c(".model" = "Model name"))
+
+# Display the combined data frame using kable
+combined_results |>
+  kable(caption = "Ranked ATM1 Models based on AICc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+**ATM1: Model Coefficients Summary**
+
+1. **ARIMA(1,1,0)**: Significant `ar1` (p = 0.000), `sma1` (p = 0.000), and `sma2` (p = 0.024) indicate this model captures both autoregressive and seasonal components effectively.
+
+2. **ARIMA(0,1,1)**: Significant `ma1` (p = 0.000), `sma1` (p = 0.000), and `sma2` (p = 0.050) suggest this model captures short-term and seasonal dependencies.
+
+3. **SARIMA(1,1,1)(0,1,1)[7]**: Significant `ar1` (p = 0.002), `ma1` (p = 0.000), and `sma1` (p = 0.000) show the model effectively captures both short-term autoregressive and seasonal moving average patterns.
+
+4. **Stepwise ARIMA**: Significant `ma1`, `sma1`, and `sma2` terms (all p < 0.05) make this model suitable for short-term and seasonal effects, with a structure of ARIMA(0,0,1)(0,1,2)[7].
+
+Given the significant coefficients, the **Stepwise ARIMA** model is an effective choice for forecasting ATM1 cash withdrawals.
+
+```{r}
+# Extract model coefficients for each fitted model
+model_coefficients <- tidy(atm1_fit)
+
+# Display the model coefficients using kable
+model_coefficients |>
+  kable(caption = "ATM1 Model Coefficients Summary") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+
+```
+
+##### ATM1: Residual Analysis
+
+**Residual Analysis of the Best Forecasting Model**
+
+The residual analysis ensures that the selected model captures the underlying patterns of the data effectively, leaving only random noise in the residuals. From the plots:
+
+- The **time plot** of the residuals shows random fluctuations around zero with no visible pattern, suggesting the model has successfully accounted for the data's structure.
+
+- The **ACF plot** of the residuals shows no significant autocorrelation, as all spikes remain within the threshold, indicating the residuals resemble white noise.
+
+- The **histogram** of the residuals shows a distribution centered around zero, with no extreme skewness or kurtosis, suggesting that the residuals are normally distributed. This further supports the adequacy of the model.
+
+```{r}
+atm1_fit |>
+  select(stepwise) |>
+  gg_tsresiduals()
+```
+
+**Ljung-Box Test for Residuals of the Best Model**
+
+The Ljung-Box test checks for autocorrelation in the residuals of the model. A high p-value indicates that the residuals do not show significant autocorrelation, supporting the adequacy of the model.
+
+- The Ljung-Box test returns a **p-value of 0.1038**, which is above the 0.05 significance threshold, suggesting no significant autocorrelation in the residuals.
+
+- The test statistic **(lb_stat = 11.90)** is moderate, confirming that the model captures the underlying patterns in the data adequately.
+
+- These results indicate that the residuals behave like white noise, supporting the **stepwise** model as a good choice for forecasting.
+
+```{r}
+augment(atm1_fit) |>
+  filter(.model=='stepwise') |>
+  features(.innov, ljung_box, lag = 10, dof = 3) |>
+  kable(caption = "ATM1 Ljung-Box Test for Residuals of the Best Model") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+##### ATM1: Calculate Forecast 
+
+**Forecasting ATM1 Cash Withdrawals**
+
+The forecast for ATM1 cash withdrawals over the next 14 days, based on the chosen model, shows a continuation of the established pattern, with fluctuations in the predicted cash withdrawals. The forecast includes **80%** and **95% prediction intervals**, with the actual values expected to fall within these ranges. The forecast indicates that the model captures the seasonality and variability in the data well, with wider intervals reflecting increasing uncertainty over time.
+
+```{r}
+# Generate the forecast for the best model ('search')
+forecast_atm1 <- atm1_fit |>
+  forecast(h = "14 days") |>
+  filter(.model == "search")
+
+# Extract just the ATM, date, and the forecast mean without any distribution info
+forecast_atm1_clean <- forecast_atm1 |>
+  as_tibble() |> 
+  select(atm, .model, date, .mean)
+
+ forecast_atm1 |>
+  autoplot(atm1_data)
+```
+
+**Save and Display the Forecast**
+
+```{r}
+ 
+# Export the cleaned data to CSV
+write.csv(forecast_atm1_clean, "forecast_atm1_search_model_clean.csv", row.names = FALSE)
+
+# Display the forecast data
+forecast_atm1_clean %>%
+  kable(caption = "ATM1 Forecast Results for Best Model") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+### ATM2
+
+**Plot the data and identify any unusual observations**
+
+The time series plot for ATM2 cash withdrawals shows clear **weekly seasonality** but no obvious long-term trend, with occasional spikes in variance. To prepare this series for modeling, a **Box-Cox transformation** may be necessary to stabilize the variance, and **differencing** (both non-seasonal and seasonal) will likely be required to remove the seasonality and make the series stationary for accurate forecasting.
+
+```{r}
+# Plot for ATM2
+atm2_data <- atm_data |>
+  filter(atm == "ATM2")
+
+atm2_data|>
+  ggplot(aes(x = date, y = cash)) +
+  geom_line() +
+  labs(title = "Cash Withdrawals Over Time - ATM2", x = "Date", y = "Cash Withdrawn") 
+```
+
+**Transform the data using Box-Cox transformation to stabilize the variance**
+
+***Box-Cox Transformed ATM2:*** The Box-Cox transformed plot for ATM2 shows stabilized variance over time. However, the clear weekly seasonal patterns remain, suggesting that further seasonal differencing will be required to achieve stationarity. A **SARIMA** model with appropriate seasonal components would be ideal for capturing these repeating patterns and improving forecast accuracy.
+
+```{r}
+# Step 1: Shift cash values by adding a small constant to handle zero values
+atm2_data <- atm2_data |> 
+  mutate(cash_adjusted = cash + 1)  # Adding 1 to avoid zero or negative values
+
+# Step 2: Calculate the Box-Cox transformation using the adjusted cash values
+box_cox_lambda <- atm2_data |>
+  BoxCox.lambda(cash_adjusted)  # Calculate lambda for Box-Cox
+
+# Apply transformations and differences
+atm2_data <- atm2_data |> 
+  mutate(
+    box_cox_cash = BoxCox(cash_adjusted, lambda = box_cox_lambda),  # Apply Box-Cox transformation
+  )
+
+# Step 3: Time Series Plot for Box-Cox Transformed Data
+atm2_data |>
+  ggplot(aes(x = date, y = box_cox_cash)) +
+  geom_line() +
+  labs(title = "Box-Cox Transformed ATM2",
+       x = "Time", y = "Box-Cox Transformed ATM1")
+```
+
+**Decompose the Time Series to reveal any seasonality and trend**
+
+Decomposing the time series isolates trend, seasonality, and noise, aiding in model selection and improving forecasting accuracy. The STL decomposition for the **Box-Cox transformed data** of ATM2 reveals a strong **weekly seasonal pattern** and a fairly consistent **trend** until a slight dip towards the end of the period. The **remainder** shows random fluctuations, but no systematic pattern. The **Box-Cox transformation** has helped to stabilize the variance, and **seasonal differencing** will be needed to remove the seasonality. Models like **SARIMA** that account for both seasonality and trend, or **ETS**, which can model the level, trend, and seasonal components, would be appropriate choices for forecasting.
+
+```{r}
+# STL Decomposition for ATM2
+atm2_data |>
+  model(
+    stl = STL(box_cox_cash ~ trend(window = 7) + season(window = "periodic"), robust = TRUE)
+  ) |>
+  components() |>
+  autoplot() +
+  labs(title = "STL Decomposition - ATM2")
+```
+
+**ACF Plot**
+
+ACF plot to identify correlation between the time series and its lagged values, reveal seasonality, trends, and potential autoregressive or moving average components for model selection. The ACF plot for the **Box-Cox transformed ATM2 cash withdrawals** shows strong autocorrelation at **lags 7, 14, and 21**, indicating a clear **weekly seasonality** in the data. The significant spikes at multiples of 7 confirm that cash withdrawals follow a repeating weekly pattern. This pattern suggests that models incorporating seasonal components, such as **SARIMA** or **ETS**, would be appropriate for capturing this seasonality in future forecasting.
+
+```{r}
+# Generate ACF Plot for ATM2
+atm2_data |>
+  ACF(box_cox_cash) |>
+  autoplot() +
+  labs(title = "ACF Plot for ATM2 Cash Withdrawals")
+```
+
+#### ATM2 Forecasting Models {.tabset}
+
+##### ATM2: Differencing 
+
+- **Lag 7 Seasonally Differenced ATM2**: The first plot shows that seasonal differencing at lag 7 removes the weekly seasonality. However, the plot still reveals short-term dependencies and fluctuations, indicating that further adjustments, such as additional differencing, might be necessary to stabilize the series.
+
+- **Lag 1 on Lag 7 Differenced ATM2**: The second plot shows a more stable time series after applying both lag 1 and lag 7 differencing. The combined differencing effectively eliminates trend and seasonality, resulting in a stationary series that is more suitable for forecasting. However, the residuals suggest some remaining autocorrelation.
+
+- **Ljung-Box Test**: The Ljung-Box test for ATM2 shows a significant result, indicating that some autocorrelation remains even after differencing. This suggests that additional modeling techniques, such as SARIMA, which incorporates both seasonal and non-seasonal components, may be required.
+
+Given these findings, **SARIMA** models are recommended to capture both short-term dependencies and remaining autocorrelations. Alternatively, **ETS** models can be used to smooth out the level and seasonal components for improved forecasting accuracy.
+
+```{r}
+# Apply differencing
+atm2_data <- atm2_data |> 
+  mutate(
+    diff_lag7 = difference(box_cox_cash, lag = 7),        # Seasonal differencing (lag = 7)
+    diff_lag7_lag1 = difference(diff_lag7, lag = 1)        # First-order differencing after seasonal differencing
+  )
+
+# Step 1: Time Series Plot for Lag 7 Seasonally Differenced Data
+plot1_ts <- atm2_data |>
+  drop_na(diff_lag7) |>
+  autoplot(diff_lag7) + 
+  labs(title = "Lag 7 Seasonally Differenced ATM1",
+       x = "Time", y = "Lag 7 Differenced ATM2")
+
+# Step 2: Time Series Plot for Lag 1 Differenced on Lag 7 Differenced Data
+plot2_ts <- atm2_data |>
+  drop_na(diff_lag7_lag1) |>
+  autoplot(diff_lag7_lag1) + 
+  labs(title = "Lag 1 on Lag 7 Differenced ATM2",
+       x = "Time", y = "Lag 1 on Lag 7 Differenced ATM2")
+
+# Step 7: Combine all time series plots into a grid for comparison
+grid.arrange(plot1_ts, plot2_ts, ncol = 1)
+
+# Step 3: Apply Ljung-Box test to the diff_lag7_lag1 series for ATM1
+ljung_box_results <- atm2_data |>
+  drop_na(diff_lag7_lag1) |>     # Drop NA values before performing Ljung-Box test
+  features(diff_lag7_lag1, ljung_box, lag = 10)  # Apply Ljung-Box test with lag = 10
+
+# Display the Ljung-Box test results
+ljung_box_results |>
+  kable(caption = "Ljung Test Results for Lag 1 on Lag 7 Differencing") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+##### ATM2: Model Selection 
+
+**Examine the ACF/PACF plots**
+
+Based on the ACF and PACF plots for the **Box-Cox transformed cash withdrawals** (without differencing), the following models are recommended, **including differencing to achieve stationarity**:
+
+1. **ARIMA(2,1,0)**: 
+   - The **PACF** plot shows a significant spike at **lag 2**, suggesting an **AR(2)** process. The first differencing (d=1) will be applied to remove non-stationarity.
+
+2. **ARIMA(0,1,2)**: 
+   - The **ACF** plot shows significant spikes at **lag 2**, suggesting an **MA(2)** process. Again, first differencing (d=1) will be applied to remove non-stationarity.
+
+3. **SARIMA(2,1,0)(0,1,1)[7]**: 
+   - The **AR(2)** term is based on the **PACF** plot's spike at lag 2, and the seasonal component of **MA(1)** at lag 7 is to capture weekly seasonality as indicated by the significant spikes in the **ACF** plot.
+   - Seasonal differencing (D=1) will handle the weekly seasonality.
+
+4. **SARIMA(0,1,2)(0,1,1)[7]**: 
+   - The **MA(2)** term comes from the significant spike in the **ACF** plot at lag 2, while the seasonal MA(1) component captures the weekly seasonality at lag 7.
+   - Seasonal differencing (D=1) will account for the weekly seasonality.
+
+5. **SARIMA(2,1,2)(0,1,1)[7]**: 
+   - This model includes both the AR(2) and MA(2) terms based on the **PACF** and **ACF** plots' significant spikes at lag 2, respectively. 
+   - The seasonal MA(1) term at lag 7 captures the weekly seasonality, with seasonal differencing (D=1) applied to account for it.
+
+6. **ETS (Exponential Smoothing Model)**: 
+   - ETS models will handle trends and seasonality automatically without explicit differencing, making them a flexible option.
+
+```{r}
+# Plot ACF/PACF
+atm2_data |>
+  gg_tsdisplay(box_cox_cash, plot_type = 'partial', lag_max = 24)
+```
+
+##### ATM2: Fit and Select Model
+
+**ATM2: Model Selection**
+
+Based on the information criteria (AICc, BIC) and the significance of the model coefficients, the best model can be determined as follows:
+
+1. **Stepwise SARIMA Model (`stepwise`)**:
+   - **AICc** = 3309.575, which is the lowest among all models.
+   - This model efficiently captures both short-term and seasonal patterns, as indicated by the SARIMA structure **(SARIMA(2,0,2)(0,1,1)[7])**, where weekly seasonality is addressed with the seasonal component.
+   - Significant coefficients include the AR(2) and MA(2) terms, as well as the seasonal moving average (SMA) term with weekly seasonality. These significant terms suggest that the model is well-suited to handling both short-term autocorrelations and weekly seasonality.
+
+2. **Search SARIMA Model (`search`)**:
+   - **AICc** = 3313.365, slightly higher than the stepwise model.
+   - The parameterization of this model includes an ARIMA structure of **(5,0,0)(0,1,1)[7]**, which captures both seasonal and non-seasonal patterns. However, the higher AICc suggests that this model does not improve predictive power over the stepwise model.
+
+3. **SARIMA(0,1,2)(0,1,1)[7] Model**:
+   - **AICc** = 3326.465, higher than the stepwise model.
+   - This model focuses on moving average components with seasonal differencing but has a higher AICc and is less optimal compared to the stepwise SARIMA model.
+
+The **Stepwise SARIMA Model (`stepwise`)** is selected as the best model based on its lowest AICc and the significance of its coefficients. This model effectively captures the key patterns in ATM2 cash withdrawals and is the preferred choice for forecasting.
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(fable)
+library(tsibble)
+library(ggplot2)
+library(tidyr)
+library(kableExtra)
+
+# Fit ARIMA and ETS models to the Box-Cox transformed load data
+load_fit <- load_data |>
+  model(
+    arima110 = ARIMA(box_cox_load ~ pdq(1,1,0) + PDQ(2,1,1, period = 12)),    # ARIMA(1,1,0)(2,1,1)[12]
+    arima011 = ARIMA(box_cox_load ~ pdq(0,1,1) + PDQ(2,1,0, period = 12)),    # ARIMA(0,1,1)(2,1,0)[12]
+    sarima110011 = ARIMA(box_cox_load ~ pdq(1,1,0) + PDQ(0,1,1, period = 12)),  # SARIMA(1,1,0)(0,1,1)[12]
+    ets = ETS(box_cox_load),  # Exponential Smoothing Model (ETS)
+    stepwise = ARIMA(box_cox_load),  # Automatically selected ARIMA using stepwise search
+    search = ARIMA(box_cox_load, stepwise = FALSE)  # Exhaustive search for ARIMA model
+  )
+
+# Extract the model summary with AICc and BIC values
+model_summary <- glance(load_fit) |>
+  arrange(AICc) |>
+  select(.model, AIC, AICc, BIC)
+
+# Pivot the wide-format mable to long format
+model_orders <- load_fit |>
+  pivot_longer(cols = everything(), names_to = ".model", values_to = "model_details") |>
+  mutate(order_info = map_chr(model_details, ~ as.character(.))) |>
+  select(.model, order_info)
+
+# Combine the AICc, BIC, and ARIMA orders into a single data frame
+combined_results <- model_summary |>
+  left_join(model_orders, by = ".model")
+
+# Display the combined data frame using kable
+combined_results |>
+  kable(caption = "Ranked Models for Load Data by AICc") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+
+**ATM2: Model Coefficients Summary**
+
+1. **Stepwise ARIMA (ARIMA(2,0,2)(0,1,1)[7])**: Significant `ar1` (p = 0.000), `ar2` (p = 0.000), `ma1` (p = 0.000), `ma2` (p = 0.000), and `sma1` (p = 0.000) indicate this model captures both autoregressive and seasonal components effectively.
+
+2. **SARIMA(0,1,2)(0,1,1)[7]**: Significant `ma1` (p = 0.000) and `sma1` (p = 0.000), but non-significant `ma2` (p = 0.732), showing the model captures short-term and seasonal dependencies but is less optimal due to higher AICc.
+
+3. **SARIMA(2,1,0)(0,1,1)[7]**: Significant `ar1`, `ar2`, and `sma1` (all p < 0.05) indicate this model effectively captures autoregressive and seasonal components, though its AICc is higher.
+
+Given the significant coefficients, the **Stepwise ARIMA** model is the most effective choice for forecasting ATM2 cash withdrawals.
+
+```{r}
+# Extract model coefficients for each fitted model
+model_coefficients <- tidy(atm2_fit)
+
+# Display the model coefficients using kable
+model_coefficients %>%
+  kable(caption = "Summary of ATM2 Model Coefficients") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+
+```
+
+##### ATM2: Residual Analysis
+
+**Residual Analysis of the Best Forecasting Model**
+
+The residual analysis evaluates whether the chosen model effectively captures the patterns in the data, leaving only random noise. The analysis shows:
+
+- The **time plot** of residuals shows no discernible pattern, with residuals fluctuating randomly around zero, indicating that the model has captured most of the structure in the data.
+
+- The **ACF plot** reveals no significant autocorrelations, as all lags fall within the confidence intervals, suggesting the residuals behave like white noise.
+
+- The **histogram** of residuals is symmetrically centered around zero, with no signs of skewness or extreme outliers, indicating that the residuals follow a normal distribution. 
+
+These results confirm the adequacy of the model for forecasting.
+
+```{r}
+atm2_fit |>
+  select(stepwise) |>
+  gg_tsresiduals()
+```
+
+**Ljung-Box Test for Residuals of the Best Model**
+
+The Ljung-Box test assesses whether there is any significant autocorrelation remaining in the residuals. A high p-value suggests that the residuals behave like white noise, supporting the adequacy of the model.
+
+- The Ljung-Box test returns a **p-value of 0.1038**, which is above the 0.05 threshold, indicating no significant autocorrelation in the residuals.
+  
+- The test statistic **(lb_stat = 11.90)** further supports the conclusion that the model has captured the key patterns in the data.
+
+These results suggest that the residuals behave like white noise, confirming the **stepwise** model as a suitable choice for forecasting.
+
+```{r}
+augment(atm2_fit) |>
+  filter(.model=='stepwise') |>
+  features(.innov, ljung_box, lag = 10, dof = 3) |>
+  kable(caption = "ATM2 Ljung-Box Test for Residuals of the Best Model") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+##### ATM2: Calculate Forecast 
+
+**Forecasting ATM2 Cash Withdrawals**
+
+The forecast for ATM2 cash withdrawals over the next 14 days, based on the chosen model, reflects the ongoing seasonal pattern with fluctuations in the predicted cash amounts. The forecast incorporates **80%** and **95% prediction intervals**, with the true values expected to fall within these ranges. The intervals widen over time, indicating increased uncertainty in the forecast further into the future, while the model continues to capture the regular patterns and variability in the data effectively.
+
+```{r}
+# Generate the forecast for the best model ('search')
+forecast_atm2 <- atm2_fit |>
+  forecast(h = "14 days") |>
+  filter(.model == "search")
+
+# Extract just the ATM, date, and the forecast mean without any distribution info
+forecast_atm2_clean <- forecast_atm2 |>
+  as_tibble() |> 
+  select(atm, .model, date, .mean)
+
+ forecast_atm2 |>
+  autoplot(atm2_data)
+```
+
+**Save and Display the Forecast**
+
+```{r}
+ 
+# Export the cleaned data to CSV
+write.csv(forecast_atm2_clean, "forecast_atm1_search_mode2_clean.csv", row.names = FALSE)
+
+# Display the model coefficients using kable
+forecast_atm2_clean %>%
+  kable(caption = "Summary of ATM2 Best Model Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+
+### ATM3
+
+**Plot the data and identify any unusual observations**
+
+**ATM3** has no discernible trends or seasonality due to minimal withdrawal activity, aside from a few large withdrawals at the end. With only three significant observations, it is premature to develop complex models for this ATM. However, simpler models such as **Naive**, **Random Walk**, and **ARIMA(0,1,0)** will be used until more data becomes available to capture potential trends, variability, and seasonality more effectively.
+
+```{r}
+# Plot for ATM3
+# Filter atm3_data for the period 4/28/2010 to 4/30/2010
+atm3_data <- atm_data %>%
+  filter(atm == "ATM3")
+
+atm3_data |>
+  ggplot(aes(x = date, y = cash)) +
+  geom_line() +
+  labs(title = "Cash Withdrawals Over Time - ATM3", x = "Date", y = "Cash Withdrawn") 
+```
+##### ATM3: Fit and Select Model
+
+**ATM3: Model Selection**
+
+Based on the forecast plots for ATM3 cash withdrawals using filtered data:
+
+1. **ARIMA(0,1,0)**: Shows a declining trend with moderate uncertainty. It may over-simplify the data but could be useful in the short term given the limited data points.
+
+2. **Mean Model**: Provides a flat forecast with narrow confidence intervals, but it doesn’t capture potential fluctuations or trends.
+
+3. **Naive Model**: Projects the last observation forward with wider intervals, which could lead to underfitting as it fails to capture any data trends.
+
+4. **Random Walk Model**: Reflects the fluctuations in the data with broader confidence intervals, capturing the variability better than simpler models.
+
+5. **Random Walk with Drift**: Incorporates a trend, but the extremely wide intervals reduce its reliability for longer-term forecasts.
+
+**Random Walk** and **ARIMA(0,1,0)** models are preferable. **Random Walk** is better for capturing ongoing fluctuations, while **ARIMA(0,1,0)** may be suited for capturing a declining trend. As more data becomes available, a more complex model might be needed.
+
+```{r}
+# Filter the data to exclude zeros (start from April 28, 2010)
+atm3_filtered_data <- atm3_data %>%
+  filter(cash > 0)
+
+# Fit models to the filtered ATM3 data (no Box-Cox transformation in this case)
+atm3_fit <- atm3_filtered_data |>
+  model(
+    Mean = MEAN(cash),               # Mean model
+    Naive = NAIVE(cash),             # Naive model
+    # Seasonal_naive = SNAIVE(cash),   # Seasonal Naive model
+    random_walk = RW(cash),          # Random Walk model
+    random_walk_drift = RW(cash ~ drift()),  # Random Walk with Drift
+    arima010 = ARIMA(cash ~ pdq(0,1,0))      # Non-seasonal ARIMA(0,1,0)
+  )
+
+# Generate forecasts for 14 days (assuming h = 14)
+atm3_fc <- atm3_fit |> forecast(h = 14)
+
+# Plot forecasts with the original filtered time series overlayed
+atm3_fc |>
+  autoplot(atm3_filtered_data, level = c(80, 95)) +  # Overlay original filtered time series with 80% & 95% confidence intervals
+  facet_wrap(~ .model, scales = "free", ncol = 2) +  # Separate panels for each model, 2 columns
+  labs(
+    y = "Cash Withdrawals",
+    title = "Forecasts for ATM3 Cash Withdrawals (Filtered Data)"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))
+
+```
+
+##### ATM3: Residual Analysis
+
+**Residual Analysis of ARIMA(0,1,0) Model**
+
+Given that this ATM has just been installed and the dataset contains only 3 data points, simpler models are currently more suitable. However, as more data becomes available, more complex models will likely be required to capture trend, variance, and seasonality. Here's a summary of each model's performance based on the residual plots:
+
+1. **Mean Model**: Shows large residuals and poor fit. Not suitable for capturing data variability.
+   
+2. **Naive Model**: Underfits the data, with large residual spikes on April 29. Doesn't capture the trend well.
+
+3. **Random Walk Model**: Performs similarly to the Naive model, with large residuals and poor fit.
+
+4. **Random Walk with Drift**: Residuals show an increasing trend, indicating the model doesn't capture the data's changes effectively.
+
+5. **ARIMA(0,1,0)**: Best model for now. Balanced residuals, centered around zero, with no significant autocorrelation. Suitable for current and future forecasting.
+
+**ARIMA(0,1,0)** is the best model given the limited data, but more complex models may be needed in the future to handle trends, variability, and seasonality as the dataset grows.
+
+```{r}
+# Generate gg_tsresiduals for each model
+mean_residuals <- atm3_fit |>
+  select(Mean) |>
+  gg_tsresiduals() + 
+  labs(title = "Mean Model Residuals (April 20-30)")
+mean_residuals
+
+naive_residuals <- atm3_fit |>
+  select(Naive) |>
+  gg_tsresiduals() + 
+  labs(title = "Naive Model Residuals (April 20-30)")
+naive_residuals
+
+rw_residuals <- atm3_fit |>
+  select(random_walk) |>
+  gg_tsresiduals() + 
+  labs(title = "Random Walk Model Residuals (April 20-30)")
+rw_residuals
+
+rw_drift_residuals <- atm3_fit |>
+  select(random_walk_drift) |>
+  gg_tsresiduals() + 
+  labs(title = "Random Walk with Drift Model Residuals (April 20-30)")
+rw_drift_residuals
+
+arima_residuals <- atm3_fit |>
+  select(arima010) |>
+  gg_tsresiduals() + 
+  labs(title = "ARIMA(0,1,0) Model Residuals (April 20-30)")
+arima_residuals
+
+
+```
+
+##### ATM3: Calculate Forecast 
+
+**Forecast for ATM4 Cash Withdrawals**
+
+```{r}
+# Filter the forecast for the ARIMA(0,1,0) model
+arima010_fc <- atm3_fc |> filter(.model == "arima010")
+
+# Convert to a data frame
+arima010_fc_df <- as.data.frame(arima010_fc)
+
+# Extract just the ATM, date, and the forecast mean without any distribution info
+forecast_atm3_clean <- arima010_fc_df |>
+  as_tibble() |> 
+  select(atm, .model, date, .mean)
+
+# Save the ARIMA(0,1,0) forecast to a CSV file
+write.csv(forecast_atm3_clean, "atm3_arima010_cash_forecast.csv", row.names = FALSE)
+
+# View the ARIMA(0,1,0) forecast data in the console
+forecast_atm3_clean |>
+  kable(caption = "ATM3 Forecast Results for Best Model") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+
+### ATM4
+
+**Plot the data and identify any unusual observations**
+
+**ATM4** displays no clear trend but shows increasing variance, with large fluctuations and more volatile withdrawal behavior.
+
+```{r}
+# Plot for ATM4
+atm4_data <- atm_data |>
+  filter(atm == "ATM4") 
+
+atm4_data |>
+  ggplot(aes(x = date, y = cash)) +
+  geom_line() +
+  labs(title = "Cash Withdrawals Over Time - ATM4", x = "Date", y = "Cash Withdrawn") 
+```
+
+**Transform the data using Box-Cox transformation to stabilize the variance**
+
+The time series plot for **ATM4** shows high variability and strong weekly seasonality with occasional large spikes. To stabilize the variance, a **Box-Cox transformation** has been applied, as seen in the transformed plot. Although this transformation reduces variance, the clear seasonal patterns suggest that further **seasonal differencing** is required to make the series stationary, making **SARIMA** a suitable model for capturing both seasonal and non-seasonal patterns.
+
+```{r}
+# Step 1: Shift cash values by adding a small constant to handle zero values
+atm4_data <- atm4_data |> 
+  mutate(cash_adjusted = cash + 1)  # Adding 1 to avoid zero or negative values
+
+# Step 2: Calculate the Box-Cox transformation using the adjusted cash values
+box_cox_lambda <- atm4_data |>
+  BoxCox.lambda(cash_adjusted)  # Calculate lambda for Box-Cox
+
+# Apply transformations and differences
+atm4_data <- atm4_data |> 
+  mutate(
+    box_cox_cash = BoxCox(cash_adjusted, lambda = box_cox_lambda),  # Apply Box-Cox transformation
+  )
+
+# Step 3: Time Series Plot for Box-Cox Transformed Data
+atm4_data |>
+  ggplot(aes(x = date, y = box_cox_cash)) +
+  geom_line() +
+  labs(title = "Box-Cox Transformed ATM1",
+       x = "Time", y = "Box-Cox Transformed ATM1")
+```
+
+**Decompose the Time Series to reveal any seasonality and trend**
+
+Decomposing the time series isolates trend, seasonality, and noise, aiding in model selection and improving forecasting accuracy. **ATM4**: The plot reveals a clear **weekly seasonal pattern** and a rising **trend** after early 2010. The non-constant **trend** makes the series **non-stationary**, as the cash withdrawals do not maintain a constant mean, and the **remainder** has significant variability, further contributing to **non-stationarity**.
+
+```{r}
+# STL Decomposition for ATM4
+atm4_data |>
+  model(
+    stl = STL(box_cox_cash ~ trend(window = 7) + season(window = "periodic"), robust = TRUE)
+  ) |>
+  components() |>
+  autoplot() +
+  labs(title = "STL Decomposition - ATM4")
+```
+
+**ACF Plot**
+
+ACF plot to identify correlation between the time series and its lagged values, reveal seasonality, trends, and potential autoregressive or moving average components for model selection. The **ACF plot** for **ATM4** cash withdrawals shows significant spikes at lags 7, 14, and 21, indicating a strong weekly seasonality. The seasonal autocorrelation suggests that a SARIMA model with a weekly seasonal component would be appropriate for forecasting.
+
+```{r}
+# Generate ACF Plot for ATM4
+atm4_data |>
+  ACF(box_cox_cash) |>
+  autoplot() +
+  labs(title = "ACF Plot for ATM4 Cash Withdrawals") 
+```
+
+#### ATM4 Forecasting Models {.tabset}
+
+##### ATM4: Differencing 
+
+The **Lag 7 Seasonally Differenced ATM1** plot shows that seasonal differencing has removed much of the weekly seasonality, but some fluctuations and short-term dependencies remain. After applying **Lag 1 differencing on the Lag 7 differenced data**, the resulting time series appears more stable and closer to stationarity, with less noticeable fluctuations. This suggests that while seasonal differencing (lag 7) was effective, lag 1 differencing helped further refine the series, making it more suitable for forecasting. However, the extent of improvement from lag 1 differencing is moderate, indicating that it was not strictly essential but beneficial for achieving a more stable time series.
+
+```{r}
+# Apply differencing
+atm4_data <- atm4_data |> 
+  mutate(
+    diff_lag7 = difference(box_cox_cash, lag = 7),        # Seasonal differencing (lag = 7)
+    diff_lag7_lag1 = difference(diff_lag7, lag = 1)        # First-order differencing after seasonal differencing
+  )
+
+# Step 1: Time Series Plot for Lag 7 Seasonally Differenced Data
+plot1_ts <- atm4_data |>
+  drop_na(diff_lag7) |>
+  autoplot(diff_lag7) + 
+  labs(title = "Lag 7 Seasonally Differenced ATM1",
+       x = "Time", y = "Lag 7 Differenced ATM1")
+
+# Step 2: Time Series Plot for Lag 1 Differenced on Lag 7 Differenced Data
+plot2_ts <- atm4_data |>
+  drop_na(diff_lag7_lag1) |>
+  autoplot(diff_lag7_lag1) + 
+  labs(title = "Lag 1 on Lag 7 Differenced ATM1",
+       x = "Time", y = "Lag 1 on Lag 7 Differenced ATM1")
+
+# Step 7: Combine all time series plots into a grid for comparison
+grid.arrange(plot1_ts, plot2_ts, ncol = 1)
+
+# Step 3: Apply Ljung-Box test to the diff_lag7_lag1 series for ATM1
+ljung_box_results <- atm4_data |>
+  drop_na(diff_lag7_lag1) |>     # Drop NA values before performing Ljung-Box test
+  features(diff_lag7_lag1, ljung_box, lag = 10)  # Apply Ljung-Box test with lag = 10
+
+# Display the Ljung-Box test results
+ljung_box_results |>
+  kable(caption = "ATM4 Ljung Test Results for Lag 1 on Lag 7 Differencing") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+##### ATM4: Model Selection 
+
+**Examine the ACF/PACF plots**
+
+```{r}
+# Plot ACF/PACF
+atm4_data |>
+  gg_tsdisplay(box_cox_cash, plot_type = 'partial', lag_max = 24)
+```
+
+##### ATM4: Fit and Select Model
+
+**ATM4: Model Selection**
+
+Based on a combination of information criteria (AICc and BIC) and the significance of the model coefficients, the **SARIMA(1,1,1)(0,1,1)[7]** model emerges as the best choice for the following reasons:
+
+1. **Information Criteria**:
+   - **Lowest AICc (5203.956)** and BIC (5219.354), indicating a strong fit compared to other models.
+
+2. **Significance of Coefficients**:
+   - The **MA(1)** coefficient is highly significant, with a p-value of **0.000**.
+   - The **Seasonal MA(1)** (SMA1) is also highly significant with a p-value of **0.000**.
+   - The **AR(1)** coefficient has a p-value slightly above 0.05 (p = 0.111), but it still shows a meaningful contribution to the model, especially given the other significant terms.
+
+The **SARIMA(0,1,1)(0,1,1)[7]** model is also a good option but is slightly inferior due to a higher AICc and BIC and lacks the autoregressive term that might capture additional dynamics in the series.
+
+
+```{r}
+# Fit ARIMA, SARIMA, and ETS models to the Box-Cox transformed ATM data
+atm4_fit <- atm4_data |>
+  model(
+    arima110 = ARIMA(box_cox_cash ~ pdq(1,1,0)),    # ARIMA(1,1,0)
+    # arima011 = ARIMA(box_cox_cash ~ pdq(0,1,1)),    # ARIMA(0,1,1)
+    # arima111 = ARIMA(box_cox_cash ~ pdq(1,1,1)),    # ARIMA(1,1,1)
+    sarima111011 = ARIMA(box_cox_cash ~ pdq(1,1,1) + PDQ(0,1,1, period = 7)),  # SARIMA(1,1,1)(0,1,1)[7]
+    sarima011011 = ARIMA(box_cox_cash ~ pdq(0,1,1) + PDQ(0,1,1, period = 7)),  # SARIMA(0,1,1)(0,1,1)[7]
+    sarima101011 = ARIMA(box_cox_cash ~ pdq(1,0,1) + PDQ(0,1,1, period = 7)),  # SARIMA(1,0,1)(0,1,1)[7]
+    ets = ETS(box_cox_cash),  # Exponential Smoothing Model (ETS)
+    stepwise = ARIMA(box_cox_cash),                # Automatically selected ARIMA using stepwise search
+    search = ARIMA(box_cox_cash, stepwise = FALSE)  # Automatically selected ARIMA using exhaustive search
+  )
+
+# Extract the model summary with AICc and BIC values
+model_summary <- glance(atm4_fit) |>
+  arrange(AICc) |>
+  select(.model, AIC, AICc, BIC, MSE, AMSE)
+
+# Extract the ARIMA orders (p,d,q) for each model
+model_orders <- atm4_fit |>
+  pivot_longer(cols = -atm, names_to = "Model name", values_to = "Orders") |>
+  select(`Model name`, Orders)
+
+# Combine the AICc, BIC and ARIMA orders into a single data frame
+combined_results <- model_summary |> 
+  left_join(model_orders, by = c(".model" = "Model name"))
+
+# Display the combined data frame using kable
+combined_results %>%
+  kable(caption = "Ranked ATM 4 Models based on AICc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+**ATM4: Model Coefficients Summary**
+
+Based on the coefficients and significance:
+
+1. **ARIMA(1,1,0)**: All terms are significant (p < 0.05), indicating a strong autoregressive model with seasonal adjustments.
+
+2. **SARIMA(1,1,1)(0,1,1)[7]**: Significant **ma1** and **sma1** (p < 0.001) but an insignificant **ar1** (p = 0.111), making it less preferable.
+
+3. **SARIMA(0,1,1)(0,1,1)[7]**: Both **ma1** and **sma1** are highly significant (p < 0.001), making it a strong candidate for capturing short-term and seasonal dependencies.
+
+4. **SARIMA(1,0,1)(0,1,1)[7]**: All terms are highly significant (p < 0.001), offering a good fit with autoregressive, moving average, and seasonal components.
+
+5. **ETS**: Provides a good fit for level and seasonality but lacks p-values for a detailed statistical evaluation.
+
+6. **Stepwise ARIMA**: Significant **sar1** (p = 0.001) and **constant** (p < 0.001), indicating a strong seasonal component and fit.
+
+7. **Search ARIMA**: Similar to stepwise with significant **sar1** (p = 0.001) and **constant** (p < 0.001), providing a strong alternative.
+
+**SARIMA(1,0,1)(0,1,1)[7]** and **Stepwise ARIMA** are the best models based on the coefficients and significance, both having highly significant terms and providing a good balance of autoregressive, moving average, and seasonal components. **ARIMA(1,1,0)** offers a simpler alternative.
+
+```{r}
+# Extract model coefficients for each fitted model
+model_coefficients <- tidy(atm4_fit)
+
+# Display the model coefficients using kable
+model_coefficients %>%
+  kable(caption = "Summary of ATM4 Model Coefficients") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+
+```
+
+##### ATM4: Residual Analysis
+
+**Residual Analysis of SARIMA(1,1,1)(0,1,1)[7] Model**
+
+The residual analysis for the **SARIMA(1,1,1)(0,1,1)[7]** model shows the following:
+
+1. **Residual Time Plot**: The residuals fluctuate around zero without clear patterns, indicating the model has captured the main structures of the data well.
+2. **ACF Plot**: There are no significant spikes in the ACF, indicating that there is no remaining autocorrelation, and the residuals resemble white noise.
+3. **Histogram**: The residuals appear to be symmetrically distributed around zero, suggesting no major issues with skewness or outliers.
+
+These results support the adequacy of the SARIMA(1,1,1)(0,1,1)[7] model in capturing the underlying patterns of the data.
+
+```{r}
+atm4_fit |>
+  select(sarima111011) |>
+  gg_tsresiduals()
+```
+
+**Ljung-Box Test for SARIMA(1,1,1)(0,1,1)[7] Model**
+
+The Ljung-Box test for the residuals of the **SARIMA(1,1,1)(0,1,1)[7]** model returns a **p-value of 0.2255**, which is well above the 0.05 significance level. This indicates no significant autocorrelation remains in the residuals.
+
+The test statistic **(lb_stat = 9.39)** further supports the conclusion that the residuals resemble white noise, making the **SARIMA(1,1,1)(0,1,1)[7]** model an adequate choice for forecasting.
+
+```{r}
+augment(atm4_fit) |>
+  filter(.model=='sarima111011') |>
+  features(.innov, ljung_box, lag = 10, dof = 3) |>
+  kable(caption = "ATM4 Ljung-Box Test for Residuals of the Best Model") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+##### ATM4: Calculate Forecast 
+
+**Forecast for ATM4 Cash Withdrawals**
+
+The forecast for ATM4 cash withdrawals over the next period shows the model capturing the fluctuating nature of the data, with predicted values continuing along the established pattern. The **80%** and **95% prediction intervals** widen as the forecast horizon extends, reflecting increased uncertainty. This suggests the model is effectively accounting for short-term fluctuations, but there is some uncertainty in predicting future cash withdrawals.
+
+```{r}
+# Generate the forecast for the best model ('search')
+forecast_atm4 <- atm4_fit |>
+  forecast(h = "14 days") |>
+  filter(.model == "sarima111011")
+
+# Extract just the ATM, date, and the forecast mean without any distribution info
+forecast_atm4_clean <- forecast_atm4 |>
+  as_tibble() |> 
+  select(atm, .model, date, .mean)
+
+ forecast_atm4 |>
+  autoplot(atm4_data)
+```
+
+**Save and Display the Forecast**
+
+```{r}
+ 
+# Export the cleaned data to CSV
+write.csv(forecast_atm4_clean, "forecast_atm4_search_model_clean.csv", row.names = FALSE)
+
+# Display the ATM4 Forcast Results
+forecast_atm4_clean %>%
+  kable(caption = "ATM4 Forcast Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Combine the four forecast data frames into one
+combined_forecast <- bind_rows(forecast_atm1_clean, forecast_atm2_clean, forecast_atm3_clean, forecast_atm4_clean)
+
+# Save the combined data frame to a CSV file
+write.csv(combined_forecast, "combined_forecast_atms.csv", row.names = FALSE)
+
+
+```
+
+
+# Part B - Residential Customer Forecast
+
+## 1. Introduction
+
+In **Part B** of this project, we analyze residential load_id load data to explore patterns and trends over time, focusing on handling missing data and preparing the dataset for time series forecasting. The dataset consists of daily energy consumption records from multiple customers, including the date of each record, load_id identifier, and energy load (kWh). The data presents challenges, such as missing values in both the load_id and load columns. Our goal is to address these gaps using appropriate imputation techniques while preserving the time series characteristics, including potential seasonality and trends. By transforming and visualizing the data, we aim to develop a robust forecasting model that can predict future energy load.
+
+## 2. Data Preparation
+
+### Load the data
+
+A review of the data shows that the dataset consists of multiple rows and columns. Here is a brief description of the columns:
+
+- **YYYY-MMM**: Contains the dates for the energy records.
+- **CaseSequence**: Specifies the Load identifier.
+- **KWH**: Records the energy load in kilowatt-hours.
+
+```{r}
+# Load necessary libraries
+library(tsibble)
+library(lubridate)
+library(readxl)
+library(kableExtra)
+
+# Load the file (replace the file path with your actual file location)
+file_path <- "ResidentialCustomerForecastLoad-624.xlsx"
+load_data <- read_excel(file_path)
+
+# Convert the date column to yearmonth format and make it a tsibble
+load_data <- load_data %>%
+  mutate(date = yearmonth(`YYYY-MMM`)) %>%  # Convert to yearmonth format
+  rename(load_id = CaseSequence, load = KWH) %>%  # Rename columns for clarity
+  select(-`YYYY-MMM`) %>%  # Drop original column
+  as_tsibble(index = date)  # Convert to tsibble with date as the index
+
+# Display the first few rows of the updated data
+load_data %>%
+  head() %>%
+  kable(caption = "Residential Customer Load Data (Yearmonth Format)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+## 3. Time Series Exploration and Imputation
+
+The time series plot shows a significant anomaly in July 2010, where the energy load drops sharply. This anomaly, along with a noticeable break in the line plot, indicates both an unusual dip and missing data. To handle these issues, the missing values will be filled using **seasonal imputation**, where the missing values are imputed based on the median energy load for the same month across different years. The sharp drop in July 2010 will also be replaced by the median value for the same month to ensure consistency and avoid distortion in the time series analysis.
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Detect the dip programmatically (e.g., check for a significant drop)
+dip_threshold <- 0.5 * mean(load_data$load, na.rm = TRUE)
+
+# Identify rows where the load is significantly below the average (e.g., July 2010 dip)
+dip_data <- load_data %>%
+  filter(load < dip_threshold, format(date, "%Y-%m") == "2010-07")
+
+# Identify missing values in the dataset
+missing_data <- load_data %>%
+  filter(is.na(load))
+
+# Combine dip_data and missing_data into one data frame
+combined_data <- bind_rows(dip_data, missing_data)
+
+# Display the combined data frame
+combined_data |>
+  kable(caption = "Missing value and anomaly") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Plot with both missing values and the dip highlighted
+ggplot(load_data, aes(x = date, y = load)) +
+  geom_line() +
+  geom_point(data = dip_data, aes(x = date, y = load), color = "red", size = 3) +  # Highlight the dip
+  geom_text(data = dip_data, aes(x = date, y = load, label = paste0(date, "\n", round(load, 0))),
+            vjust = 1.05, color = "red", size = 4) +  # Label the dip
+  labs(title = "Energy Load Over Time with July 2010 Dip and Missing Values Highlighted",
+       y = "Load (kWh)",
+       x = "Date")
+
+
+```
+
+The plot of the imputed time series exhibits a clear seasonal pattern with recurring peaks and troughs, reflecting periodic fluctuations in the energy load. There is also an upward trend over time, indicating increasing energy demand. Additionally, the variance seems to grow over time, suggesting non-constant variability in the data.
+
+For accurate forecasting, these factors must be accounted for. Models like **SARIMA** could handle both seasonality and trends, while **ETS** models could capture trend, seasonality, and variance changes. Adjusting for these aspects will improve forecasting accuracy.
+
+Key observations:
+- **Trend**: The plot exhibit a generally increasing trend over time, which needs to be considered for long-term forecasting.
+- **Seasonality**: There is a clear annual seasonality in both plots, suggesting that any model should account for periodic fluctuations, likely on a yearly basis.
+- **Variance**: The variance appears to be changing over time (heteroscedasticity), which require Box-Cox transformation to help stabilize.
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+# Identify the median load for each month
+median_monthly_load <- load_data %>%
+  group_by(month = month(date, label = TRUE), year = year(date)) %>%
+  summarize(median_load = median(load, na.rm = TRUE))
+
+# Impute missing values using the median of the same month across years
+load_data <- load_data %>%
+  mutate(
+    month = month(date, label = TRUE),
+    # Replace missing values with median for the same month
+    load = ifelse(is.na(load), 
+                  ave(load, month, FUN = function(x) median(x, na.rm = TRUE)), 
+                  load),
+    # Replace July 2010 dip with the median value for July
+    load = ifelse(
+      format(date, "%Y-%m") == "2010-07" & load < (0.5 * mean(load, na.rm = TRUE)), 
+      median(load[month == "Jul"], na.rm = TRUE), 
+      load
+    )
+  )
+
+# Drop the extra 'month' column added for processing
+load_data <- load_data %>% select(-month)
+
+# Plot to verify the correction
+ggplot(load_data, aes(x = date, y = load)) +
+  geom_line() +
+  labs(title = "Energy Load Over Time with Imputed Missing Values and Corrected July 2010 Dip",
+       y = "Load (kWh)",
+       x = "Date")
+
+```
+
+**Transform the data using Box-Cox transformation to stabilize the variance**
+
+The first plot shows the energy load over time with missing values imputed and the significant July 2010 dip corrected. The second plot shows the same energy load data after applying the Box-Cox transformation. 
+
+Key observations:
+- **Trend**: Both plots exhibit a generally increasing trend over time, which needs to be considered for long-term forecasting.
+- **Seasonality**: There is a clear annual seasonality in both plots, suggesting that any model should account for periodic fluctuations, likely on a yearly basis.
+- **Variance**: In the original plot, the variance appears to be changing over time (heteroscedasticity), which the Box-Cox transformation helps stabilize.
+
+Box-Cox transformation reduces the variance, making the time series more homoscedastic and potentially improving the performance of forecasting models.
+
+```{r}
+# Load necessary libraries
+library(fable)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(kableExtra)
+
+# Apply Box-Cox transformation (assuming load_data already exists)
+load_data <- load_data %>%
+  mutate(
+    box_cox_load = box_cox(load, lambda = 0.5),  # Example lambda value
+    diff_lag12 = difference(box_cox_load, lag = 12),   # Seasonal differencing (lag = 12)
+  )
+
+# Step 1: Time Series Plot for Lag 12 Seasonally Differenced Data
+plot1_ts <- load_data %>%
+  select(date, diff_lag12) %>%
+  drop_na(diff_lag12) %>%
+  ggplot(aes(x = date, y = diff_lag12)) +
+  geom_line() +
+  labs(title = "Lag 12 Seasonally Differenced Load",
+       x = "Date", y = "Lag 12 Differenced Load")
+
+# Step 2: Plot the Box-Cox transformed data
+plot2_ts <- load_data %>%
+  ggplot(aes(x = date, y = box_cox_load)) +
+  geom_line() +
+  labs(title = "Box-Cox Transformed Load",
+       x = "Date", y = "Box-Cox Transformed Load")
+
+# Step 4: Combine all time series plots into a grid for comparison
+grid.arrange(plot2_ts, plot1_ts, ncol = 1)
+
+# Step 5: Apply Ljung-Box test to the diff_lag12_lag1 series
+ljung_box_results <- load_data %>%
+  drop_na(diff_lag12) %>%
+  features(diff_lag12, ljung_box, lag = 10)  # Apply Ljung-Box test with lag = 10
+
+
+```
+### Decompose the Time Series
+
+The STL decomposition plot shows the following:
+
+1. **Original Series (Box-Cox Transformed Load)**: The overall energy load pattern with seasonal peaks and troughs, showing a clear repeating seasonal pattern each year.
+   
+2. **Trend**: The long-term upward trend is generally stable with slight fluctuations, particularly around 2005, where the trend increases before stabilizing.
+
+3. **Seasonal Component**: The seasonal pattern is quite regular, with a consistent annual cycle. This indicates that the energy load exhibits strong seasonal effects across years.
+
+4. **Remainder**: The remainder component captures the residual variations that aren't explained by the trend or seasonal components. Noticeable spikes in the remainder, especially in the later periods, indicate unexplained irregularities in the data that may require further investigation.
+
+This decomposition is essential in understanding the distinct components of the data, which will help in selecting and refining models for accurate forecasting. By isolating the trend and seasonality, we can build models that predict the future behavior of the energy load more effectively.
+
+```{r}
+# Load necessary libraries for plotting and STL decomposition
+library(fable)
+library(fabletools)
+library(ggplot2)
+
+# Ensure the data has the required column for STL decomposition
+# Assuming the Box-Cox transformed data is already in 'box_cox_load' column
+# Perform STL decomposition
+decomp_box_cox <- load_data %>%
+  model(
+    stl = STL(box_cox_load ~ trend(window = 13) + season(window = "periodic"), robust = TRUE)
+  ) %>%
+  components()  # Extract the decomposition components
+
+# Plot the decomposition results
+autoplot(decomp_box_cox) +
+  labs(title = "STL Decomposition of Box-Cox Transformed Load",
+       x = "Date", y = "Value")
+
+```
+### Examine the ACF/PACF plots:
+
+Based on the ACF and PACF plots for the **Box-Cox transformed load** (without differencing), the following models are recommended, **including differencing to achieve stationarity**:
+
+1. **ARIMA(1,1,0)**: The **PACF plot** shows a significant spike at **lag 1**, indicating a strong AR(1) component. First differencing (d=1) is necessary to remove the non-stationarity in the series and make it stationary.
+
+2. **ARIMA(0,1,1)**: The **ACF plot** shows a clear spike at **lag 1**, suggesting an MA(1) component. First differencing (d=1) will be applied to address the non-stationary nature of the data.
+
+3. **SARIMA(1,1,0)(0,1,1)[12]**: Seasonal spikes at **lag 12** in the ACF plot indicate yearly seasonality. This model will include an AR(1) component for short-term dependencies and a seasonal MA(1) component to account for the yearly seasonal pattern, with both seasonal and non-seasonal differencing.
+
+4. **SARIMA(0,1,1)(0,1,1)[12]**: This model, incorporating an MA(1) and seasonal MA(1) component, is suggested based on the ACF spikes at lag 1 and lag 12. Both seasonal and non-seasonal differencing will be included to account for annual seasonality.
+
+5. **SARIMA(1,1,1)(0,1,1)[12]**: A mixed model with both AR(1) and MA(1) components, along with seasonal MA(1), is suitable to capture short-term dependencies and yearly seasonality. This model includes both non-seasonal and seasonal differencing.
+
+6. **ETS (Exponential Smoothing State Space Model)**: ETS models automatically handle trends and seasonality without requiring explicit differencing. It provides an alternative to ARIMA models, which need differencing to stabilize the data, making ETS a flexible choice to account for trend and seasonal components.
+
+These models incorporate necessary non-seasonal and seasonal differencing to address stationarity and capture the autocorrelation patterns identified in the ACF/PACF plots, ensuring a better fit for future forecasting.
+
+```{r}
+# Load necessary library
+library(feasts)
+library(tsibble)
+library(ggplot2)
+
+# Assuming `load_data` contains the time series data and we focus on `box_cox_load`
+# Visualize the time series, ACF, and PACF using gg_tsdisplay
+# Plot ACF/PACF
+load_data |>
+  gg_tsdisplay(box_cox_load, plot_type = 'partial', lag_max = 24) +
+  labs(
+    title = "Time Series, ACF, and PACF of Box-Cox Transformed Load",
+    y = "Box-Cox Transformed Load",
+    x = "Date"
+  )
+
+
+```
+
+The best model can be identified by balancing both the goodness of fit (AIC, AICc, and BIC) and the examination of residual diagnostics (such as the ACF and residual distribution plots).
+
+Based on the Ljung-Box test results and the comparison of residuals from the models, the **stepwise ARIMA model** appears to be the best choice for the following reasons:
+
+1. **Residual Diagnostics**:
+   - The **stepwise ARIMA model** shows residuals that are closer to white noise, with an **Ljung-Box p-value** of **0.859**, indicating that there is no significant autocorrelation left in the residuals. This suggests that the model has adequately captured the autocorrelation structure in the data.
+   - In contrast, the **arima011 model** has a significant Ljung-Box statistic (p-value = **0.031**), meaning that there is still some autocorrelation left in the residuals, indicating that the model might not have fully captured the data's structure.
+
+2. **AIC and AICc**:
+   - The **stepwise ARIMA model** has a comparable **AIC** and **AICc** to **arima011** (AIC = **2488.31** for stepwise vs **2488.02** for arima011), meaning both models fit similarly well to the data.
+   - However, since the residuals from the stepwise model are better (no significant autocorrelation), it is a stronger model overall.
+
+3. **BIC**:
+   - The **BIC** for the **stepwise model** is slightly higher, but since the residuals are better, this is not a major concern.
+
+**Conclusion**: The **stepwise ARIMA model** is recommended as the best model due to better residual diagnostics and comparable fit statistics (AIC, AICc).
+
+Next, you can use this model for forecasting based on the time series data.
+
+```{r}
+# Display the model summary
+model_summary %>%
+  kable(caption = "Ranked Models by AICc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+# Load necessary libraries
+library(dplyr)
+library(fable)
+library(tsibble)
+library(ggplot2)
+library(tidyr)
+library(kableExtra)
+library(purrr)  # Load the purrr package for map_chr()
+
+# Define a helper function to extract ARIMA order as a string
+extract_arima_order <- function(model) {
+  arima_order <- model$fit$spec$arima$order
+  seasonal_order <- model$fit$spec$arima$seasonal_order
+  paste0("ARIMA(", arima_order$p, ",", arima_order$d, ",", arima_order$q, ")",
+         "(", seasonal_order$P, ",", seasonal_order$D, ",", seasonal_order$Q, ")[", seasonal_order$period, "]")
+}
+
+# Fit ARIMA and ETS models to the Box-Cox transformed load data
+load_fit <- load_data |>
+  model(
+    arima110 = ARIMA(box_cox_load ~ pdq(1,1,0) + PDQ(2,1,1, period = 12)),    # ARIMA(1,1,0)(2,1,1)[12]
+    arima011 = ARIMA(box_cox_load ~ pdq(0,1,1) + PDQ(2,1,0, period = 12)),    # ARIMA(0,1,1)(2,1,0)[12]
+    sarima110011 = ARIMA(box_cox_load ~ pdq(1,1,0) + PDQ(0,1,1, period = 12)),  # SARIMA(1,1,0)(0,1,1)[12]
+    ets = ETS(box_cox_load),  # Exponential Smoothing Model (ETS)
+    stepwise = ARIMA(box_cox_load),  # Automatically selected ARIMA using stepwise search
+    search = ARIMA(box_cox_load, stepwise = FALSE)  # Exhaustive search for ARIMA model
+  )
+
+# Extract the model summary with AICc and BIC values
+model_summary <- glance(load_fit) |>
+  arrange(AICc) |>
+  select(.model, AIC, AICc, BIC)
+
+
+# Extract the ARIMA orders (p,d,q) for each model
+model_orders <- load_fit |>
+  pivot_longer(everything(), names_to = "Model name", values_to = "Orders") |>
+  select(`Model name`, Orders)
+
+# Combine the AICc, BIC and ARIMA orders into a single data frame
+combined_results <- model_summary |> 
+  left_join(model_orders, by = c(".model" = "Model name"))
+
+# Display the combined data frame using kable
+combined_results %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+
+
+```{r}
+load_fit |>
+  select(arima011) |>
+  gg_tsresiduals() +
+  labs(title = "arima011 Residuals")
+
+```
+
+```{r}
+load_fit |>
+  select(stepwise) |>
+  gg_tsresiduals() +
+  labs(title = "stepwise Residuals")
+
+```
+
+
+The Ljung-Box test for the residuals of the **ARIMA(0,1,1)** model shows a test statistic of **15.38** with a p-value of **0.0315**. 
+
+Since the p-value is **less than 0.05**, we reject the null hypothesis that the residuals are independently distributed. This suggests that there may be some remaining autocorrelation in the residuals, indicating that the model does not fully capture all the structure in the data. 
+
+Further model refinement or alternative models (such as SARIMA or adding more AR or MA terms) may be necessary to address this residual autocorrelation.
+
+```{r}
+augment(load_fit) |>
+  filter(.model=='arima011') |>
+  features(.innov, ljung_box, lag = 10, dof = 3) |>
+  kable(caption = "arima011 Ljung-Box Test for Residuals") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r}
+augment(load_fit) |>
+  filter(.model=='stepwise') |>
+  features(.innov, ljung_box, lag = 10, dof = 3) |>
+  kable(caption = "stepwise Ljung-Box Test for Residuals") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+Factoring in the significance of the model coefficients helps determine which parameters in the models are statistically significant and likely contribute meaningfully to the model. Here's how we can evaluate the models based on the significance of their coefficients:
+
+1. **arima110**:
+   - The **ar1** term is significant (p-value = **0.0000018**), showing strong evidence that the AR(1) component is important.
+   - The **sma1** term is also significant (p-value = **0.0051**), indicating the seasonal moving average component contributes to the model.
+   - However, the **sar1** (p-value = **0.1344**) and **sar2** (p-value = **0.0961**) terms are **not significant**, indicating weaker evidence for the inclusion of seasonal AR terms.
+   
+2. **arima011**:
+   - All terms are highly significant, with very small p-values (close to zero), including **ma1**, **sar1**, and **sar2**.
+   - This suggests that both the moving average component and the seasonal AR components are crucial for this model, and the overall fit is likely very strong.
+
+3. **sarima110011**:
+   - The **ar1** and **sma1** terms are highly significant (p-value < **0.0001**), which indicates a strong contribution of both short-term AR and seasonal MA components.
+
+4. **ETS**:
+   - No p-values are available because ETS models do not use traditional statistical inference for parameters, and significance tests are not applicable.
+
+5. **Stepwise and Search**:
+   - Both models have significant **ma1** (p-value = **0.00007**), **ma3** (p-value = **0.0021**), and **sar1** (p-value = **0.0000000**) terms, meaning these terms contribute significantly to the model.
+   - However, the **ma2** term (p-value = **0.6299**) is **not significant**, and this weakens the justification for including this parameter in the model.
+   - The **constant** term is also significant, indicating the model benefits from a constant drift term.
+
+**Summary of Best Model Selection:**
+
+- **arima011** emerges as the best model based on both **coefficient significance** and the overall **fit**. All terms in this model are highly significant, and the residuals are well-behaved.
+- **Stepwise** and **Search** models are also competitive, but the presence of non-significant terms (like **ma2**) suggests that they might not capture the data structure as well as **arima011**.
+  
+Given that **arima011** has the lowest AIC/AICc, no residual autocorrelation (Ljung-Box p-value is non-significant), and all its terms are statistically significant, **arima011** should be selected as the best model for forecasting.
+
+```{r}
+# Extract model coefficients for each fitted model
+model_coefficients <- tidy(load_fit)
+
+# Display the model coefficients using kable
+model_coefficients %>%
+  kable(caption = "Summary of Model Coefficients") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+
+```
+
+The plot displays the forecast of the **Box-Cox transformed load** along with 80% and 95% confidence intervals. The forecast follows the observed seasonal pattern in the historical data, reflecting the model's ability to capture the recurring fluctuations. As expected, the confidence intervals widen as the forecast extends into the future, indicating greater uncertainty in the long-term predictions. This widening suggests that while the model provides a reliable short-term forecast, the uncertainty increases over time. Overall, the forecast maintains a consistent trend with the historical data, demonstrating the model's effectiveness in capturing both trend and seasonality.
+
+```{r}
+# Generate the forecast for the best model ('search')
+forecast_load <- load_fit |>
+  forecast(h = "12 months") |>
+  filter(.model == "stepwise")
+
+# Extract just the ATM, date, and the forecast mean without any distribution info
+forecast_clean <- forecast_load |>
+  as_tibble() |> 
+  select(.model, date, .mean)
+
+ forecast_load |>
+  autoplot(load_data)
+```
+**Save and Display the Forecast**
+
+```{r}
+ 
+# Export the cleaned data to CSV
+write.csv(forecast_clean, "ForecastLoad.csv", row.names = FALSE)
+
+# Display the ATM4 Forcast Results
+forecast_clean %>%
+  kable(caption = "Forecasted Load (kwh)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+
+
+## 4. Forecasting Model {.tabset}
+
+### Fit and Select Model
+
+Fit ARIMA and ETS models to the data and select the best model:
+
+```{r}
+# Fit ARIMA and ETS models
+customer1_fit <- customer1_data %>%
+  model(
+    arima = ARIMA(load),
+    ets = ETS(load)
+  )
+
+# Display model summary
+customer1_fit %>%
+  glance() %>%
+  kable(caption = "Customer 1 Model Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
